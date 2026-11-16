@@ -46,26 +46,42 @@ Pole_pairs = 6              # Gain Pole_pairs (subsystem "E-motor velocity and a
 TWO_PI = 2 * math.pi        # Constant "Constant" (2*pi) used by Mod / Mod1
 
 # Offset [electrical deg] ADDED to the angle that goes into the Hall decoder (hall_sensors).
-# 0 = exactly the Simulink model. With the Ke tables of the model the Hall sectors are ~90 deg out of
-# phase with the back-EMF (see --scan-hall-offset); +90 aligns commutation with the back-EMF.
+# Keep 0 when KE_TABLES = "ALIGNED". With KE_TABLES = "ORIGINAL" (tables of the slx) +90 gives the same
+# alignment from the Hall side (see --scan-hall-offset).
 HALL_OFFSET_DEG = 0.0
 
 # Lookup_n-D  Ke_a / Ke_b / Ke_c : breakpoints -6:12:354 [electrical deg], linear, extrapolation Clip
-Ke_bp_start = -6.0
-Ke_bp_step = 12.0
-Ke_a_table = [0.010610, 0.007597, 0.006207, 0.005337, 0.004402, 0.002985, -0.003013, -0.004403, -0.005273, -0.006208,
-              -0.007625, -0.010610, -0.010610, -0.010610, -0.010610, -0.010610, -0.007597, -0.006207, -0.005337,
-              -0.004402, -0.002985, 0.003013, 0.004403, 0.005273, 0.006208, 0.007625, 0.010610, 0.010610, 0.010610,
-              0.010610, 0.010610]
-Ke_b_table = [-0.002985, 0.003013, 0.004403, 0.005273, 0.006208, 0.007625, 0.010610, 0.010610, 0.010610, 0.010610,
-              0.010610, 0.007597, 0.006208, 0.005337, 0.004402, 0.002985, -0.003013, -0.004403, -0.005273, -0.006208,
-              -0.007625, -0.010610, -0.010610, -0.010610, -0.010610, -0.010610, -0.007597, -0.006207, -0.005337,
-              -0.004402, -0.002985]
-Ke_c_table = [-0.007625, -0.010610, -0.010610, -0.010610, -0.010610, -0.010610, -0.007597, -0.006207, -0.005337,
-              -0.004402, -0.002985, 0.003013, 0.004403, 0.005273, 0.006208, 0.007625, 0.010610, 0.010610, 0.010610,
-              0.010610, 0.010610, 0.007597, 0.006207, 0.005337, 0.004402, 0.002985, -0.003013, -0.004403, -0.005273,
-              -0.006208, -0.007625]
-_KE_N = len(Ke_a_table)     # 31 points
+# The tables are built from the measured line-to-line back-EMF (back_emf_1200rpm_20C.csv, 1200 rpm, 20 degC)
+# by make_ke_tables.py:  line-to-line -> phase (star equivalent) -> divide by 125.66 rad/s.
+#   KE_SHIFT_DEG = 0  : tables exactly as in emotor_cam_move_3_phase.slx (they are ~90 deg out of phase
+#                       with the Hall sectors of the model: mean line back-EMF ~ 0, no net power)
+#   KE_SHIFT_DEG = 84 : tables rotated by +84 deg (7 breakpoints, only the order of the values changes);
+#                       commutation and back-EMF are aligned (line back-EMF 0.0155 ... 0.0182 V/(rad/s))
+# Ke_new(phi) = Ke_old(phi - shift).  Paste the arrays printed by  python make_ke_tables.py  into the
+# three Lookup_n-D blocks of the Simulink model to get the same behaviour there.
+import make_ke_tables as ke_data
+
+Ke_bp_start = ke_data.BP_START
+Ke_bp_step = ke_data.BP_STEP
+_KE_N = ke_data.N                        # 31 points (-6 ... 354 deg, last point = first point)
+KE_SHIFT_DEG = 84.0
+KE_TABLES = "ALIGNED"                    # "ALIGNED" (shift KE_SHIFT_DEG) or "ORIGINAL" (shift 0, as in the slx)
+Ke_a_table, Ke_b_table, Ke_c_table = ke_data.phase_ke(KE_SHIFT_DEG)
+
+
+def select_tables(which, shift_deg=None):
+    """Switch between the aligned and the original tables (module-level, used by all functions)."""
+    global Ke_a_table, Ke_b_table, Ke_c_table, KE_TABLES, KE_SHIFT_DEG
+    which = which.strip().upper()
+    if which == "ALIGNED":
+        if shift_deg is not None:
+            KE_SHIFT_DEG = shift_deg
+        Ke_a_table, Ke_b_table, Ke_c_table = ke_data.phase_ke(KE_SHIFT_DEG)
+    elif which == "ORIGINAL":
+        Ke_a_table, Ke_b_table, Ke_c_table = ke_data.phase_ke(0.0)
+    else:
+        raise ValueError('KE_TABLES must be "ALIGNED" or "ORIGINAL", got %r' % (which,))
+    KE_TABLES = which
 
 
 def Ke_lookup(table, deg):
@@ -304,6 +320,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Three-phase currents / back-EMFs of emotor_cam_move_3_phase.slx")
     ap.add_argument("--stop-time", type=float, help="override StopTime of the main script [s]")
     ap.add_argument("--hall-mode", choices=["INTERPOLATION", "NOINTERPOLATION"], help="override HALL_MODE")
+    ap.add_argument("--ke-shift", type=float, help="shift [deg] of the back-EMF tables for ALIGNED (default 84)")
+    ap.add_argument("--ke-tables", choices=["ALIGNED", "ORIGINAL"], help="back-EMF tables: ALIGNED (default, shifted) or ORIGINAL (as in the slx)")
     ap.add_argument("--hall-offset", type=float, help="HALL_OFFSET_DEG: electrical deg added to the Hall decoder input")
     ap.add_argument("--scan-hall-offset", action="store_true", help="print mean line back-EMF vs Hall offset and exit")
     ap.add_argument("--check", action="store_true", help="verify against emotor_cam_move.simulate() first")
@@ -315,6 +333,8 @@ if __name__ == "__main__":
         base.StopTime = a.stop_time
     if a.hall_mode:
         base.HALL_MODE = a.hall_mode
+    if a.ke_tables or a.ke_shift is not None:
+        select_tables(a.ke_tables or "ALIGNED", a.ke_shift)
     if a.hall_offset is not None:
         HALL_OFFSET_DEG = a.hall_offset
     if a.scan_hall_offset:
@@ -324,8 +344,8 @@ if __name__ == "__main__":
         best = max(scan_hall_offset(1), key=lambda r: r[1])
         print("best offset: %d deg (mean e_line/Wi = %.4f)" % (best[0], best[1]))
         sys.exit(0)
-    print("CONTROL_MODE = %s  HALL_MODE = %s  StopTime = %g s  h = %g s"
-          % (base.CONTROL_MODE, base.HALL_MODE, base.StopTime, base.h))
+    print("CONTROL_MODE = %s  HALL_MODE = %s  KE_TABLES = %s (shift %g deg)  HALL_OFFSET_DEG = %g  StopTime = %g s  h = %g s"
+          % (base.CONTROL_MODE, base.HALL_MODE, KE_TABLES, KE_SHIFT_DEG if KE_TABLES == "ALIGNED" else 0.0, HALL_OFFSET_DEG, base.StopTime, base.h))
     if a.check:
         check_against_main()
     log = simulate_three_phase()
