@@ -50,6 +50,18 @@ TWO_PI = 2 * math.pi        # Constant "Constant" (2*pi) used by Mod / Mod1
 # alignment from the Hall side (see --scan-hall-offset).
 HALL_OFFSET_DEG = 0.0
 
+# How the three phase currents are calculated:
+#   "INDEPENDENT" : three independent RL branches, each driven by Va/Vb/Vc (as in emotor_cam_move_3_phase.slx);
+#                   the "open" phase is just driven with 0 V and still conducts through its own back-EMF
+#   "STAR_DIODE"  : star connection with ISOLATED neutral (i_a + i_b + i_c = 0) and freewheeling diodes.
+#                   Driven phases: terminal voltage +/- V_in/2.  The phase that has just been switched off keeps
+#                   its current and decays through the diode of its half-bridge (terminal clamped to the DC-link
+#                   rail: -Vdc/2 for i > 0, +Vdc/2 for i < 0); when it reaches 0 it floats (i = 0) until the next
+#                   commutation. The neutral voltage follows from the constraint sum(i) = 0:
+#                   v_n = sum(v_x - e_x) / N_active  (equal R and L per phase). Nothing is forced to zero.
+PHASE_MODEL = "INDEPENDENT"
+I_TOL = 1e-6                 # [A] below this a switched-off phase counts as already at zero (floating)
+
 # Lookup_n-D  Ke_a / Ke_b / Ke_c : breakpoints -6:12:354 [electrical deg], linear, extrapolation Clip
 # The tables are built from the measured line-to-line back-EMF (back_emf_1200rpm_20C.csv, 1200 rpm, 20 degC)
 # by make_ke_tables.py:  line-to-line -> phase (star equivalent) -> divide by 125.66 rad/s.
@@ -124,6 +136,14 @@ def hall_sensors(elec_deg):
 # ----------------------------------------------------------------------------
 # MATLAB Function "inverter_commutation"  (inputs: H1, H2, H3, V_in)
 # ----------------------------------------------------------------------------
+COMMUTATION_SIGNS = {5: (1, -1, 0), 4: (1, 0, -1), 6: (0, 1, -1), 2: (-1, 1, 0), 3: (-1, 0, 1), 1: (0, -1, 1)}
+
+
+def commutation_signs(H1, H2, H3):
+    """sa, sb, sc = +1 (driven positive), -1 (driven negative), 0 (open) for the Hall state."""
+    return COMMUTATION_SIGNS.get(H1 * 4 + H2 * 2 + H3, (0, 0, 0))
+
+
 def inverter_commutation(H1, H2, H3, V_in):
     state = H1 * 4 + H2 * 2 + H3 * 1
     V_half = V_in / 2
@@ -145,23 +165,30 @@ def inverter_commutation(H1, H2, H3, V_in):
 # ----------------------------------------------------------------------------
 # State derivatives: main model (Li, Wi, Aint, Wi1) + three phase currents (ia, ib, ic)
 # ----------------------------------------------------------------------------
-def derivatives(x, Vapp, Vph):
+def derivatives(x, Vapp, Vph, floating=None):
     Li, Wi, Aint, Wi1, ia, ib, ic = x
     d = base.plant_derivatives(Li, Wi, Aint, Wi1, Vapp)       # main model, unchanged
     deg = electrical_angle_deg(Wi1)
     ea = Ke_lookup(Ke_a_table, deg) * Wi                      # Product e_a
     eb = Ke_lookup(Ke_b_table, deg) * Wi                      # Product e_b
     ec = Ke_lookup(Ke_c_table, deg) * Wi                      # Product e_c
-    return d + ((Vph[0] - ea - Rc_ph * ia) / Lc_ph,           # Vsum1 / Lc1  -> Li1 (i_a)
-                (Vph[1] - eb - Rc_ph * ib) / Lc_ph,           # Vsum2 / Lc2  -> Li2 (i_b)
-                (Vph[2] - ec - Rc_ph * ic) / Lc_ph)           # Vsum3 / Lc3  -> Li3 (i_c)
+    if floating is None:                                      # PHASE_MODEL = "INDEPENDENT"
+        return d + ((Vph[0] - ea - Rc_ph * ia) / Lc_ph,       # Vsum1 / Lc1  -> Li1 (i_a)
+                    (Vph[1] - eb - Rc_ph * ib) / Lc_ph,       # Vsum2 / Lc2  -> Li2 (i_b)
+                    (Vph[2] - ec - Rc_ph * ic) / Lc_ph)       # Vsum3 / Lc3  -> Li3 (i_c)
+    # PHASE_MODEL = "STAR_DIODE": Vph = terminal voltages, floating[k] = phase k is at i = 0 and floats
+    e = (ea, eb, ec)
+    i = (ia, ib, ic)
+    act = [k for k in range(3) if not floating[k]]
+    vn = sum(Vph[k] - e[k] for k in act) / len(act) if act else 0.0      # neutral voltage from sum(i) = 0
+    return d + tuple(0.0 if floating[k] else (Vph[k] - vn - Rc_ph * i[k] - e[k]) / Lc_ph for k in range(3))
 
 
-def rk4_step(x, Vapp, Vph, dt):
-    k1 = derivatives(x, Vapp, Vph)
-    k2 = derivatives(tuple(xi + 0.5 * dt * k for xi, k in zip(x, k1)), Vapp, Vph)
-    k3 = derivatives(tuple(xi + 0.5 * dt * k for xi, k in zip(x, k2)), Vapp, Vph)
-    k4 = derivatives(tuple(xi + dt * k for xi, k in zip(x, k3)), Vapp, Vph)
+def rk4_step(x, Vapp, Vph, dt, floating=None):
+    k1 = derivatives(x, Vapp, Vph, floating)
+    k2 = derivatives(tuple(xi + 0.5 * dt * k for xi, k in zip(x, k1)), Vapp, Vph, floating)
+    k3 = derivatives(tuple(xi + 0.5 * dt * k for xi, k in zip(x, k2)), Vapp, Vph, floating)
+    k4 = derivatives(tuple(xi + dt * k for xi, k in zip(x, k3)), Vapp, Vph, floating)
     return tuple(xi + dt / 6.0 * (a + 2 * b + 2 * c + d)
                  for xi, a, b, c, d in zip(x, k1, k2, k3, k4))
 
@@ -175,7 +202,8 @@ LOG_NAMES = ["t",
              # three-phase branch (as in the Simulink model)
              "elec_deg", "H1", "H2", "H3", "Vapp2", "Va", "Vb", "Vc", "ea", "eb", "ec", "ia", "ib", "ic",
              # extras (not in Simulink)
-             "eab", "ebc", "eca", "i_sum", "P_elec", "Tm_3ph"]
+             "eab", "ebc", "eca", "i_sum", "P_elec", "Tm_3ph",
+             "Vta", "Vtb", "Vtc", "Vn"]          # terminal voltages (incl. diode clamp) and neutral voltage
 
 
 def scan_hall_offset(step=1):
@@ -209,6 +237,11 @@ def simulate_three_phase():
     Aint0 = math.radians(base.START_ANGLE_DEG)
     x = (0.0, 0.0, Aint0, Aint0 * 73, 0.0, 0.0, 0.0)           # Li, Wi, Aint, Wi1, ia, ib, ic
     log = {k: [] for k in LOG_NAMES}
+    star = PHASE_MODEL.strip().upper() == "STAR_DIODE"
+    if not star and PHASE_MODEL.strip().upper() != "INDEPENDENT":
+        raise ValueError('PHASE_MODEL must be "INDEPENDENT" or "STAR_DIODE", got %r' % (PHASE_MODEL,))
+    floating = [True, True, True]          # STAR_DIODE: phase is at i = 0 and floats
+    s_prev = None
 
     for k in range(n_steps + 1):
         t = base.StartTime + k * h
@@ -233,22 +266,61 @@ def simulate_three_phase():
         H1, H2, H3 = hall_sensors((deg + HALL_OFFSET_DEG) % 360.0)
         Vapp2 = Vdc1 * PWM
         Va, Vb, Vc = inverter_commutation(H1, H2, H3, Vapp2)
+        Vt = (Va, Vb, Vc)                                       # terminal voltages used in the phase equations
+        if star:
+            sgn = commutation_signs(H1, H2, H3)
+            i_now = (ia, ib, ic)
+            vt = list(Vt)
+            for q in range(3):
+                if sgn[q] != 0:
+                    floating[q] = False                         # driven phase
+                elif s_prev is None or s_prev[q] != 0:          # phase has just been switched off
+                    floating[q] = abs(i_now[q]) < I_TOL
+                if sgn[q] == 0 and not floating[q]:             # decays through the freewheeling diode
+                    vt[q] = -0.5 * Vdc1 if i_now[q] > 0 else 0.5 * Vdc1
+                elif sgn[q] == 0:
+                    vt[q] = 0.0
+            s_prev = sgn
+            Vt = tuple(vt)
 
         if k % base.LOG_DECIMATION == 0:
             ea = Ke_lookup(Ke_a_table, deg) * Wi
             eb = Ke_lookup(Ke_b_table, deg) * Wi
             ec = Ke_lookup(Ke_c_table, deg) * Wi
             P = ea * ia + eb * ib + ec * ic
+            if star:
+                act = [q for q in range(3) if not floating[q]]
+                evec = (ea, eb, ec)
+                Vn = sum(Vt[q] - evec[q] for q in act) / len(act) if act else 0.0
+            else:
+                Vn = 0.0
             vals = dict(t=t, Li=Li, Wi=Wi, Aint=Aint, Wi1=Wi1, Gdeg=Gdeg_out, PWM=PWM, Vapp=Vapp,
                         Tm=base.Ktc * Li, elec_deg=deg, H1=H1, H2=H2, H3=H3, Vapp2=Vapp2, Va=Va, Vb=Vb, Vc=Vc,
                         ea=ea, eb=eb, ec=ec, ia=ia, ib=ib, ic=ic,
                         eab=ea - eb, ebc=eb - ec, eca=ec - ea, i_sum=ia + ib + ic, P_elec=P,
-                        Tm_3ph=P / Wi if abs(Wi) > 1e-3 else 0.0)
+                        Tm_3ph=P / Wi if abs(Wi) > 1e-3 else 0.0, Vta=Vt[0], Vtb=Vt[1], Vtc=Vt[2], Vn=Vn)
             for key in LOG_NAMES:
                 log[key].append(vals[key])
 
         if k < n_steps:
-            x = rk4_step(x, Vapp, (Va, Vb, Vc), h)
+            if not star:
+                x = rk4_step(x, Vapp, Vt, h)
+            else:
+                x_new = rk4_step(x, Vapp, Vt, h, tuple(floating))
+                i_old = (ia, ib, ic)
+                i_new = list(x_new[4:])
+                crossed = False
+                for q in range(3):                              # decaying phase reached 0 -> clamp, it floats now
+                    if sgn[q] == 0 and not floating[q] and i_new[q] * i_old[q] <= 0.0:
+                        i_new[q] = 0.0
+                        floating[q] = True
+                        crossed = True
+                if crossed:
+                    act = [q for q in range(3) if not floating[q]]
+                    if len(act) == 2:                           # keep sum(i) = 0 for the two active phases
+                        dd = 0.5 * (i_new[act[0]] - i_new[act[1]])
+                        i_new[act[0]], i_new[act[1]] = dd, -dd
+                x = x_new[:4] + tuple(i_new)
 
     return log
 
@@ -320,6 +392,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Three-phase currents / back-EMFs of emotor_cam_move_3_phase.slx")
     ap.add_argument("--stop-time", type=float, help="override StopTime of the main script [s]")
     ap.add_argument("--hall-mode", choices=["INTERPOLATION", "NOINTERPOLATION"], help="override HALL_MODE")
+    ap.add_argument("--phase-model", choices=["INDEPENDENT", "STAR_DIODE"], help="how the phase currents are calculated (default INDEPENDENT = as in the slx)")
     ap.add_argument("--ke-shift", type=float, help="shift [deg] of the back-EMF tables for ALIGNED (default 84)")
     ap.add_argument("--ke-tables", choices=["ALIGNED", "ORIGINAL"], help="back-EMF tables: ALIGNED (default, shifted) or ORIGINAL (as in the slx)")
     ap.add_argument("--hall-offset", type=float, help="HALL_OFFSET_DEG: electrical deg added to the Hall decoder input")
@@ -333,6 +406,8 @@ if __name__ == "__main__":
         base.StopTime = a.stop_time
     if a.hall_mode:
         base.HALL_MODE = a.hall_mode
+    if a.phase_model:
+        PHASE_MODEL = a.phase_model
     if a.ke_tables or a.ke_shift is not None:
         select_tables(a.ke_tables or "ALIGNED", a.ke_shift)
     if a.hall_offset is not None:
@@ -344,8 +419,8 @@ if __name__ == "__main__":
         best = max(scan_hall_offset(1), key=lambda r: r[1])
         print("best offset: %d deg (mean e_line/Wi = %.4f)" % (best[0], best[1]))
         sys.exit(0)
-    print("CONTROL_MODE = %s  HALL_MODE = %s  KE_TABLES = %s (shift %g deg)  HALL_OFFSET_DEG = %g  StopTime = %g s  h = %g s"
-          % (base.CONTROL_MODE, base.HALL_MODE, KE_TABLES, KE_SHIFT_DEG if KE_TABLES == "ALIGNED" else 0.0, HALL_OFFSET_DEG, base.StopTime, base.h))
+    print("CONTROL_MODE = %s  HALL_MODE = %s  PHASE_MODEL = %s  KE_TABLES = %s (shift %g deg)  HALL_OFFSET_DEG = %g  StopTime = %g s  h = %g s"
+          % (base.CONTROL_MODE, base.HALL_MODE, PHASE_MODEL, KE_TABLES, KE_SHIFT_DEG if KE_TABLES == "ALIGNED" else 0.0, HALL_OFFSET_DEG, base.StopTime, base.h))
     if a.check:
         check_against_main()
     log = simulate_three_phase()
