@@ -43,7 +43,7 @@ LOG_DECIMATION = 10      # store every 10th step (= every 1e-4 s, like MaxStep)
 #                       from the time between the last two edges
 # You can also give it on the command line:  python emotor_cam_move.py INTERPOLATION
 # ----------------------------------------------------------------------------
-HALL_MODE = "INTERPOLATION"       # "INTERPOLATION" or "NOINTERPOLATION"
+HALL_MODE = "NOINTERPOLATION"     # "INTERPOLATION" or "NOINTERPOLATION"
 
 # ----------------------------------------------------------------------------
 # OPTIONS: direction of rotation
@@ -65,7 +65,7 @@ WRAP_LOAD_TABLE = False
 #   CONSTANT_PWM : duty cycle as a fraction, -0.95 ... 0.95 (e.g. 0.5 = 50 % -> Vapp = 0.5 * Vdc)
 #                  negative values turn the motor backwards
 # ----------------------------------------------------------------------------
-CONTROL_MODE = "CONSTANT"         # "CONTROLLER" or "CONSTANT"
+CONTROL_MODE = "CONTROLLER"       # "CONTROLLER" or "CONSTANT"
 CONSTANT_PWM = 0.02
 
 # ----------------------------------------------------------------------------
@@ -257,7 +257,7 @@ def Tab(u):
 #   Inports : 1 phi_dot_Crank [rad/sec], 2 phi_phase_target [rad Crank], 3 phi_phase_act [rad Crank]
 #   Outport : PWM [-]
 # ----------------------------------------------------------------------------
-RT_Ts = 0.005                       # Rate Transition1/2/4  OutPortSampleTime
+RT_Ts = 0.00001                     # Rate Transition1/2/4  OutPortSampleTime (1e-5 in the Simulink model)
 PID_Ts = 0.00001                    # PID Controller3 SampleTime
 Const_73 = 73                       # Constant (SampleTime 1e-5)
 Gain_ff = 0.5                       # Gain "Gain"
@@ -281,7 +281,7 @@ class Controller:
         # PID states (Forward Euler)
         self.xi = PID_IC_integrator     # integrator state
         self.xf = PID_IC_filter         # derivative filter state
-        # Rate Transition output registers (held between 0.005 s hits)
+        # Rate Transition output registers (held between RT_Ts hits)
         self.RT1 = 0.0                  # Rate Transition1 : phi_phase_target
         self.RT2 = 0.0                  # Rate Transition2 : phi_phase_act
         self.RT4 = 0.0                  # Rate Transition4 : phi_dot_Crank
@@ -296,7 +296,7 @@ class Controller:
         self.PWM = 0.0
 
     def sample_rate_transitions(self, phi_dot_Crank, phi_phase_target, phi_phase_act):
-        # Rate Transition4 / 1 / 2  (continuous -> 0.005 s zero-order hold)
+        # Rate Transition4 / 1 / 2  (continuous -> RT_Ts zero-order hold)
         self.RT4 = phi_dot_Crank
         self.RT1 = phi_phase_target
         self.RT2 = phi_phase_act
@@ -367,7 +367,7 @@ def rk4_step(Li, Wi, Aint, Wi1, Vapp, dt):
 # ----------------------------------------------------------------------------
 def simulate():
     n_steps = int(round((StopTime - StartTime) / h))
-    rt_every = int(round(RT_Ts / h))            # 500 steps
+    rt_every = int(round(RT_Ts / h))            # 1 step (RT_Ts = h)
     ctrl = Controller()
     hall = HallInterpolator()                   # used between Camshaft_quantanizer and Gcam1
     Li = Wi = 0.0                               # integrators Li, Wi: initial condition 0
@@ -394,7 +394,7 @@ def simulate():
         Target_out = Target_Cam_angle(t)                        # Target Cam angle
         Gdeg1_out = Target_out * Gdeg1                          # Gdeg1
 
-        # --- controller: Rate Transitions sample every 0.005 s ---
+        # --- controller: Rate Transitions sample every RT_Ts ---
         if k % rt_every == 0:
             ctrl.sample_rate_transitions(ThetaTC1, Gdeg1_out, Gcam1_out)
         PWM = ctrl.output_and_update()                          # "Simplified, cascaded Controller1"
