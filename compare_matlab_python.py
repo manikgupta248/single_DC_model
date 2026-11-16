@@ -25,6 +25,14 @@ import sys
 
 import numpy as np
 
+# Import matplotlib BEFORE the MATLAB Engine is started: once MATLAB is running, its own DLLs
+# (e.g. libexpat) can shadow the ones of the Python environment and then
+# "import matplotlib" fails with "DLL load failed while importing pyexpat".
+try:
+    import matplotlib.pyplot as plt
+except Exception:                      # plotting is optional
+    plt = None
+
 # python signal name -> block name in the Simulink model (output port 1 of that block)
 SIGNALS = {
     "PWM": "Simplified, cascaded Controller1",
@@ -125,12 +133,31 @@ def metrics(ref, test):
     }
 
 
+def moving_average(y, n):
+    """Centered moving average over n samples (edges padded with the edge value)."""
+    if n <= 1:
+        return y
+    padded = np.pad(y, (n // 2, n - 1 - n // 2), mode="edge")
+    return np.convolve(padded, np.ones(n) / n, mode="valid")
+
+
+def print_table(title, rows, cols):
+    print("\n" + title)
+    print("%-22s" % "signal" + "".join("%13s" % c for c in cols))
+    for var, m in rows:
+        print("%-22s" % var + "".join("%13.5g" % m[c] for c in cols))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="emotor_cam_move.slx", help="Simulink model (MATLAB Engine mode)")
     ap.add_argument("--csv", help="use Simulink results from this csv instead of the MATLAB Engine")
     ap.add_argument("--stop-time", type=float, default=8.0, help="simulation stop time [s] (default 8)")
     ap.add_argument("--t-start", type=float, default=0.0, help="ignore data before this time [s] in the metrics")
+    ap.add_argument("--smooth-ms", type=float, default=10.0,
+                    help="window [ms] of the moving average used for the second (smoothed) metrics table; "
+                         "0 = off. Fast chatter (quantizer, PWM, current) can never match sample by sample "
+                         "between two different solvers, the smoothed comparison shows the real trend.")
     ap.add_argument("--out", default="comparison", help="prefix of the output files (png, csv)")
     ap.add_argument("--no-plot", action="store_true")
     a = ap.parse_args()
@@ -153,19 +180,26 @@ def main():
         curves[var] = (ref, test)
 
     cols = ["RMSE", "NRMSE_%", "MAE", "MaxAbsErr", "Bias", "R2"]
-    print("\nSimulink = reference, Python = test, t >= %g s, %d samples\n" % (a.t_start, int(sel.sum())))
-    print("%-22s" % "signal" + "".join("%13s" % c for c in cols))
-    for var, m in rows:
-        print("%-22s" % var + "".join("%13.5g" % m[c] for c in cols))
+    print_table("RAW samples: Simulink = reference, Python = test, t >= %g s, %d samples"
+                % (a.t_start, int(sel.sum())), rows, cols)
+
+    srows = []
+    nwin = int(round(a.smooth_ms * 1e-3 / float(np.median(np.diff(t))))) if a.smooth_ms > 0 else 0
+    if nwin > 1:
+        for var, (ref, test) in curves.items():
+            srows.append((var, metrics(moving_average(ref, nwin)[sel], moving_average(test, nwin)[sel])))
+        print_table("SMOOTHED (%g ms moving average on both signals)" % a.smooth_ms, srows, cols)
 
     with open(a.out + "_metrics.csv", "w") as f:
-        f.write("signal," + ",".join(cols) + "\n")
-        for var, m in rows:
-            f.write(var + "," + ",".join("%.8g" % m[c] for c in cols) + "\n")
+        f.write("type,signal," + ",".join(cols) + "\n")
+        for kind, rr in (("raw", rows), ("smoothed", srows)):
+            for var, m in rr:
+                f.write(kind + "," + var + "," + ",".join("%.8g" % m[c] for c in cols) + "\n")
     print("\nsaved %s_metrics.csv" % a.out)
 
-    if not a.no_plot and curves:
-        import matplotlib.pyplot as plt
+    if not a.no_plot and curves and plt is None:
+        print("matplotlib could not be imported -> no plot (check your matplotlib installation)")
+    if not a.no_plot and curves and plt is not None:
         n = len(curves)
         fig, axes = plt.subplots(n, 2, figsize=(14, 2.6 * n), squeeze=False, sharex=True)
         for i, (var, (ref, test)) in enumerate(curves.items()):
