@@ -45,6 +45,11 @@ Vdc1 = 13.5                 # Constant Vdc1
 Pole_pairs = 6              # Gain Pole_pairs (subsystem "E-motor velocity and angle")
 TWO_PI = 2 * math.pi        # Constant "Constant" (2*pi) used by Mod / Mod1
 
+# Offset [electrical deg] ADDED to the angle that goes into the Hall decoder (hall_sensors).
+# 0 = exactly the Simulink model. With the Ke tables of the model the Hall sectors are ~90 deg out of
+# phase with the back-EMF (see --scan-hall-offset); +90 aligns commutation with the back-EMF.
+HALL_OFFSET_DEG = 0.0
+
 # Lookup_n-D  Ke_a / Ke_b / Ke_c : breakpoints -6:12:354 [electrical deg], linear, extrapolation Clip
 Ke_bp_start = -6.0
 Ke_bp_step = 12.0
@@ -157,6 +162,24 @@ LOG_NAMES = ["t",
              "eab", "ebc", "eca", "i_sum", "P_elec", "Tm_3ph"]
 
 
+def scan_hall_offset(step=1):
+    """Mean line back-EMF / Wi seen by the conducting pair for each Hall offset (needs no simulation).
+    A well aligned six-step drive has a large, flat positive value (here ~0.0172 at the best offset);
+    ~0 means that commutation and back-EMF are out of phase (no net electromagnetic power)."""
+    signs = {5: (1, -1, 0), 4: (1, 0, -1), 6: (0, 1, -1), 2: (-1, 1, 0), 3: (-1, 0, 1), 1: (0, -1, 1)}
+    res = []
+    for off in range(0, 360, step):
+        v = []
+        for i in range(720):
+            th = i * 0.5
+            H = hall_sensors((th + off) % 360.0)
+            s = signs[H[0] * 4 + H[1] * 2 + H[2]]
+            v.append(s[0] * Ke_lookup(Ke_a_table, th) + s[1] * Ke_lookup(Ke_b_table, th)
+                     + s[2] * Ke_lookup(Ke_c_table, th))
+        res.append((off, sum(v) / len(v), min(v), max(v)))
+    return res
+
+
 def simulate_three_phase():
     h = base.h
     n_steps = int(round((base.StopTime - base.StartTime) / h))
@@ -191,7 +214,7 @@ def simulate_three_phase():
 
         # ---- three-phase branch ----
         deg = electrical_angle_deg(Wi1)
-        H1, H2, H3 = hall_sensors(deg)
+        H1, H2, H3 = hall_sensors((deg + HALL_OFFSET_DEG) % 360.0)
         Vapp2 = Vdc1 * PWM
         Va, Vb, Vc = inverter_commutation(H1, H2, H3, Vapp2)
 
@@ -281,6 +304,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Three-phase currents / back-EMFs of emotor_cam_move_3_phase.slx")
     ap.add_argument("--stop-time", type=float, help="override StopTime of the main script [s]")
     ap.add_argument("--hall-mode", choices=["INTERPOLATION", "NOINTERPOLATION"], help="override HALL_MODE")
+    ap.add_argument("--hall-offset", type=float, help="HALL_OFFSET_DEG: electrical deg added to the Hall decoder input")
+    ap.add_argument("--scan-hall-offset", action="store_true", help="print mean line back-EMF vs Hall offset and exit")
     ap.add_argument("--check", action="store_true", help="verify against emotor_cam_move.simulate() first")
     ap.add_argument("--out", default="three_phase", help="prefix of the output files")
     ap.add_argument("--no-plot", action="store_true")
@@ -290,6 +315,15 @@ if __name__ == "__main__":
         base.StopTime = a.stop_time
     if a.hall_mode:
         base.HALL_MODE = a.hall_mode
+    if a.hall_offset is not None:
+        HALL_OFFSET_DEG = a.hall_offset
+    if a.scan_hall_offset:
+        print("offset[deg]  mean e_line/Wi      min       max")
+        for off, m, lo, hi in scan_hall_offset(10):
+            print("%8d  %12.4f %9.4f %9.4f" % (off, m, lo, hi))
+        best = max(scan_hall_offset(1), key=lambda r: r[1])
+        print("best offset: %d deg (mean e_line/Wi = %.4f)" % (best[0], best[1]))
+        sys.exit(0)
     print("CONTROL_MODE = %s  HALL_MODE = %s  StopTime = %g s  h = %g s"
           % (base.CONTROL_MODE, base.HALL_MODE, base.StopTime, base.h))
     if a.check:
