@@ -380,6 +380,7 @@ if __name__ == "__main__":
     ap.add_argument("--evals", type=int, help="tuning evaluations per variant (default 120, quick 30)")
     ap.add_argument("--noise-i", type=float, default=0.0, help="std of noise added to the measured current [A]")
     ap.add_argument("--regen", action="store_true", help="ignore the data cache")
+    ap.add_argument("--skip-ms", type=float, default=SKIP_S * 1000, help="ignore the first N ms of every run in the metrics (default 20)")
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--out", default="torque_kf", help="prefix of the output files")
     a = ap.parse_args()
@@ -390,6 +391,7 @@ if __name__ == "__main__":
         train_pwm, train_w0, test_pwm, test_w0, evals = (0.06, 0.1, 0.15, 0.2), (0.0, 30.0), (0.08, 0.12, 0.18), (15.0, 45.0), 120
     if a.evals:
         evals = a.evals
+    SKIP_S = a.skip_ms / 1000.0
     t0 = time.time()
     print("training runs:")
     train = build_dataset(train_pwm, train_w0, a.noise_i, a.regen, a.out + "_train.pkl", "train")
