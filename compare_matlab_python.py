@@ -158,8 +158,10 @@ def main():
                     help="window [ms] of the moving average used for the second (smoothed) metrics table; "
                          "0 = off. Fast chatter (quantizer, PWM, current) can never match sample by sample "
                          "between two different solvers, the smoothed comparison shows the real trend.")
-    ap.add_argument("--out", default="comparison", help="prefix of the output files (png, csv)")
+    ap.add_argument("--out", default="comparison", help="prefix of the output files (<out>_<signal>.png, <out>_metrics.csv)")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--no-show", action="store_true", help="save the png files but do not open the figure windows")
+    ap.add_argument("--overlay-only", action="store_true", help="only the Simulink/Python overlay per signal, no error panel")
     a = ap.parse_args()
 
     folder = os.path.dirname(os.path.abspath(__file__))
@@ -200,23 +202,34 @@ def main():
     if not a.no_plot and curves and plt is None:
         print("matplotlib could not be imported -> no plot (check your matplotlib installation)")
     if not a.no_plot and curves and plt is not None:
-        n = len(curves)
-        fig, axes = plt.subplots(n, 2, figsize=(14, 2.6 * n), squeeze=False, sharex=True)
-        for i, (var, (ref, test)) in enumerate(curves.items()):
-            axes[i, 0].plot(t, ref, label="Simulink", linewidth=1.4)
-            axes[i, 0].plot(t, test, "--", label="Python", linewidth=1.0)
-            axes[i, 0].set_ylabel(var)
-            axes[i, 0].legend(fontsize=7)
-            axes[i, 0].grid(True, alpha=0.4)
-            axes[i, 1].plot(t, test - ref, color="tab:red", linewidth=0.8)
-            axes[i, 1].set_ylabel("error (Py - Sl)")
-            axes[i, 1].grid(True, alpha=0.4)
-        axes[-1, 0].set_xlabel("Time [s]")
-        axes[-1, 1].set_xlabel("Time [s]")
-        fig.tight_layout()
-        fig.savefig(a.out + ".png", dpi=200)
-        print("saved %s.png" % a.out)
-        plt.show()
+        labels = {"PWM": "PWM duty [-]", "Gdeg": "cam angle [deg]", "Wi": "e-motor speed [rad/s]",
+                  "Li": "motor current [A]", "Tab": "cam load torque [N*m]",
+                  "Camshaft_quantanizer": "quantized motor angle [rad]"}
+        stats = dict(rows)
+        for var, (ref, test) in curves.items():          # ONE figure (and one png) per signal
+            if a.overlay_only:
+                fig, ax = plt.subplots(figsize=(11, 5))
+                axes = [ax]
+            else:
+                fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+            axes[0].plot(t, ref, label="Simulink", linewidth=1.6)
+            axes[0].plot(t, test, "--", label="Python", linewidth=1.1)
+            axes[0].set_ylabel(labels.get(var, var))
+            axes[0].grid(True, alpha=0.4)
+            axes[0].legend()
+            m = stats[var]
+            axes[0].set_title("%s    RMSE = %.4g   R$^2$ = %.4f" % (var, m["RMSE"], m["R2"]))
+            if not a.overlay_only:
+                axes[1].plot(t, test - ref, color="tab:red", linewidth=0.8)
+                axes[1].set_ylabel("error\n(Python - Simulink)")
+                axes[1].grid(True, alpha=0.4)
+            axes[-1].set_xlabel("Time [s]")
+            fig.tight_layout()
+            fname = "%s_%s.png" % (a.out, var)
+            fig.savefig(fname, dpi=200)
+            print("saved %s" % fname)
+        if not a.no_show:
+            plt.show()
 
 
 if __name__ == "__main__":
