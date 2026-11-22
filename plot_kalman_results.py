@@ -40,13 +40,67 @@ PARAMS = dict(q_w=1.8558420108369016, q_i=0.6002396839788338, q_T=0.118262445430
               r_i=1.4195516188691276e-08, r_th=1.931481126190632e-05, r_w=152.87458228211878)
 
 
+def run_filter_with_gain(data, p):
+    """The filter of torque_kf.run_filter (variant no_interp), written out here so that this script also works with
+    an older torque_kf.py. It additionally records the torque gain K of the current update at every step."""
+    b = k.base
+    sl = slice(None, None, k.KF_DECIMATION)
+    t = data["t"][sl]
+    z_i = data["i_meas"][sl]
+    Q = data["Camshaft_quantanizer"][sl]
+    dt = float(t[1] - t[0])
+    F, Bd, Qd = k.build_model(dt, p["q_w"], p["q_i"], p["q_T"], {})
+    Bu = Bd * data["V"]
+    q = b.QuantizationInterval
+    n = len(t)
+    x = np.array([data["Wi1"][0], 0.0, 0.0, 0.0])
+    P = np.diag([1e-6, 1e-4, 1e-4, 0.05 ** 2])
+    out = np.zeros((n, 4))
+    out[0] = x
+    gains = []
+    t_edge_prev, s_prev = None, 0.0
+    for i in range(1, n):
+        x = F @ x + Bu                                   # predict
+        P = F @ P @ F.T + Qd
+        S = P[2, 2] + p["r_i"]                           # current update, every step
+        K = P[:, 2] / S
+        gains.append(float(K[3]))                        # gain of the torque state
+        x = x + K * (z_i[i] - x[2])
+        P = P - np.outer(K, P[2])
+        if Q[i] == Q[i - 1]:                             # no Hall edge in this step
+            out[i] = x
+            continue
+        s = 1.0 if Q[i] > Q[i - 1] else -1.0             # Hall edge: angle update
+        w_hat = x[1]
+        z = Q[i] - s * q / 2 + w_hat * dt / 2
+        r = p["r_th"] + (w_hat * dt) ** 2 / 12
+        K = P[:, 0] / (P[0, 0] + r)
+        x = x + K * (z - x[0])
+        P = P - np.outer(K, P[0])
+        t_edge = t[i] - dt / 2                           # speed from the time between two edges
+        if t_edge_prev is not None and s == s_prev:
+            dte = t_edge - t_edge_prev
+            w_meas = s * q / dte
+            wdot = (b.Ktc * x[2] - b.Bc * x[1] - x[3]) / b.J
+            r_w = p["r_w"] + (wdot * dte / 2) ** 2 + (w_meas * dt / dte) ** 2 / 6
+            K = P[:, 1] / (P[1, 1] + r_w)
+            x = x + K * (w_meas - x[1])
+            P = P - np.outer(K, P[1])
+        t_edge_prev, s_prev = t_edge, s
+        P = 0.5 * (P + P.T)
+        out[i] = x
+    return out, gains
+
+
 def run_case(angle):
     """Simulate one sweep and run the Kalman filter on it. Returns a dict with everything to plot."""
     data = k.generate_run(PWM, angle, +1)
     if data is None:
         raise RuntimeError("the cam did not move 40 deg for start angle %g" % angle)
-    gains = []
-    x = k.run_filter(data, VARIANT, PARAMS, {}, gains=gains)         # estimates (n x 4), gains (n-1)
+    x, gains = run_filter_with_gain(data, PARAMS)                    # estimates (n x 4), gains (n-1)
+    ref = k.run_filter(data, VARIANT, PARAMS, {})                    # check against the filter of torque_kf.py
+    if np.abs(ref - x).max() > 1e-9:
+        print("WARNING: the filter in this script differs from torque_kf.run_filter by %.2e" % np.abs(ref - x).max())
     sl = slice(None, None, k.KF_DECIMATION)
     t_ms = (data["t"][sl] - data["t"][0]) * 1000.0
     return dict(angle=angle,
