@@ -157,8 +157,9 @@ def build_model(dt, q_w, q_i, q_T, mm):
     return F, Bd, 0.5 * (Qd + Qd.T)
 
 
-def run_filter(data, variant, p, mm, dec=KF_DECIMATION):
-    """p = dict(q_w, q_i, q_T, r_i, r_th) in linear units. Returns the estimates (decimated)."""
+def run_filter(data, variant, p, mm, dec=KF_DECIMATION, gains=None):
+    """p = dict(q_w, q_i, q_T, r_i, r_th) in linear units. Returns the estimates (decimated).
+    gains: optional list; if given, the torque gain K of the current update is appended at every step."""
     sl = slice(None, None, dec)
     t = data["t"][sl]
     z_i = data["i_meas"][sl]
@@ -183,6 +184,8 @@ def run_filter(data, variant, p, mm, dec=KF_DECIMATION):
         # --- current update (every step) ---
         S = P[2, 2] + r_i
         K = P[:, 2] / S
+        if gains is not None:
+            gains.append(float(K[3]))
         x = x + K * (z_i[k] - x[2])
         P = P - np.outer(K, P[2])
         # --- angle update ---
