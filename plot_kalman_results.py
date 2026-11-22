@@ -111,10 +111,18 @@ def run_case(angle):
                 gain=np.array(gains))                                 # torque gain, steps 1 ... n-1
 
 
+def both_metrics(c, skip_ms):
+    """Metrics of the camshaft torque estimate: (all steps from the first step on, steps after the first skip_ms)."""
+    first = np.arange(len(c["t_ms"])) >= 1                 # point 0 is only the starting guess, not an estimate
+    late = c["t_ms"] >= skip_ms
+    m_all = k.metrics(c["true_cam"][first], c["est_cam"][first])
+    m_ex = k.metrics(c["true_cam"][late], c["est_cam"][late])
+    return m_all, m_ex
+
+
 def torque_figure(c, skip_ms, out_dir, show):
-    keep = c["t_ms"] >= skip_ms
-    m = k.metrics(c["true_cam"][keep], c["est_cam"][keep])
-    fig, ax = plt.subplots(figsize=(10, 6.0))
+    m_all, m_ex = both_metrics(c, skip_ms)
+    fig, ax = plt.subplots(figsize=(10, 6.4))
     ax.plot(c["cam"], c["true_cam"], color="#555555", lw=4.0, label="true torque (simulation)")
     ax.plot(c["cam"][1:], c["est_cam"][1:], color="#2e7d32", lw=1.8, ls="--",
             label="Kalman filter estimate (%s)" % VARIANT)
@@ -124,17 +132,17 @@ def torque_figure(c, skip_ms, out_dir, show):
                 arrowprops=dict(arrowstyle="->", color="#2e7d32"), va="center")
     ax.set_xlabel("cam angle [deg]", fontsize=11)
     ax.set_ylabel("camshaft torque [N*m]", fontsize=11)
-    note = "RMSE %.3f N*m = %.2f %% of the rms torque, R2 = %.4f" % (m["RMSE"], m["RMSE_pct"], m["R2"])
-    if skip_ms > 0:
-        note += "  (first %g ms left out)" % skip_ms
-    ax.set_title("Start angle %g deg, PWM %.2f: true and estimated camshaft torque\n%s" % (c["angle"], PWM, note), fontsize=12)
+    note = ("including the first %g ms:    RMSE %.3f N*m = %.2f %% of the rms torque,  R2 = %.4f\n"
+            "without the first %g ms:   RMSE %.3f N*m = %.2f %% of the rms torque,  R2 = %.4f"
+            % (skip_ms, m_all["RMSE"], m_all["RMSE_pct"], m_all["R2"], skip_ms, m_ex["RMSE"], m_ex["RMSE_pct"], m_ex["R2"]))
+    ax.set_title("Start angle %g deg, PWM %.2f: true and estimated camshaft torque\n%s" % (c["angle"], PWM, note), fontsize=11)
     ax.grid(True, alpha=0.4)
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, fontsize=10)
     fig.tight_layout()
     path = os.path.join(out_dir, "kalman_torque_start%d.png" % round(c["angle"]))
     fig.savefig(path, dpi=150)
     print("saved %s" % path)
-    return m, fig
+    return (m_all, m_ex), fig
 
 
 def gain_figure(c, out_dir):
@@ -170,7 +178,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-show", action="store_true", help="save the png files but do not open the figures")
     ap.add_argument("--out-dir", default=".", help="folder for the png files (default: current folder)")
-    ap.add_argument("--skip-ms", type=float, default=20.0, help="start-up time left out of the metrics [ms] (default 20)")
+    ap.add_argument("--skip-ms", type=float, default=20.0, help="start-up time [ms] that is left out in the second metric (default 20)")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
@@ -180,12 +188,15 @@ def main():
         cases.append(run_case(angle))
 
     print()
-    print("%-12s %-12s %-26s %-24s" % ("start angle", "duration", "torque error (rms)", "settled torque gain"))
+    print("Torque error (RMSE of the camshaft torque, in N*m and in % of the rms torque):")
+    print("%-12s %-10s %-30s %-30s %-10s" % ("start angle", "duration", "including the first %g ms" % a.skip_ms,
+                                          "without the first %g ms" % a.skip_ms, "gain"))
     for c in cases:
-        keep = c["t_ms"] >= a.skip_ms
-        m = k.metrics(c["true_cam"][keep], c["est_cam"][keep])
-        print("%-12s %-12s %-26s %-24s" % ("%g deg" % c["angle"], "%.3f s" % (c["t_ms"][-1] / 1000),
-                                           "%.3f N*m (%.2f %%)" % (m["RMSE"], m["RMSE_pct"]), "%.3f" % c["gain"][-1]))
+        m_all, m_ex = both_metrics(c, a.skip_ms)
+        print("%-12s %-10s %-30s %-30s %-10s" % (
+            "%g deg" % c["angle"], "%.3f s" % (c["t_ms"][-1] / 1000),
+            "%.3f N*m (%.2f %%)" % (m_all["RMSE"], m_all["RMSE_pct"]),
+            "%.3f N*m (%.2f %%)" % (m_ex["RMSE"], m_ex["RMSE_pct"]), "%.3f" % c["gain"][-1]))
     print()
     for i, j in ((0, 2), (1, 3)):
         n = min(len(cases[i]["est_cam"]), len(cases[j]["est_cam"]))
