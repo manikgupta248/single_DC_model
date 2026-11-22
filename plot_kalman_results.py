@@ -204,12 +204,6 @@ def gain_current_figure(c, out_dir):
     ax.text(0.5, 0.45, "gain between %.5f and %.5f over the whole movement:\nthe current measurement is trusted almost completely,\n"
             "the estimate takes over %.3f %% of every current error" % (g.min(), g.max(), 100 * g.min()),
             transform=ax.transAxes, ha="center", va="center", fontsize=11, color="#1f4e79")
-    ins = ax.inset_axes([0.08, 0.08, 0.5, 0.25])
-    ins.semilogx(t, (1 - g) * 1e5, color="#c0392b", lw=1.4)
-    ins.set_title("zoom: the part of the error that is NOT accepted, (1 - gain) x 1e5", fontsize=8.5)
-    ins.set_ylim(0, (1 - g).max() * 1e5 * 1.3)
-    ins.grid(True, alpha=0.4, which="both")
-    ins.tick_params(labelsize=8)
     fig.tight_layout()
     path = os.path.join(out_dir, "kalman_gain_current_pwm%.2f_start%d.png" % (c["pwm"], round(c["angle"])))
     fig.savefig(path, dpi=150)
