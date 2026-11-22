@@ -19,7 +19,9 @@ probability (the model of a sensor that is sampled every 0.1 ms).
 What the script does
   1) default: sensitivity table. Torque error (RMSE in % of the rms camshaft torque) on the test runs for
      no noise / each source alone / all sources together, with a given filter tuning.
-  2) --tune: tunes the filter again for the combined noise and shows the table with the old and the new tuning.
+  2) --plot: graphs (png) of the torque with and without noise for every noise source, the difference, a summary.
+     --plot-only draws them again from the saved <out>.json without recomputing anything.
+  3) --tune: tunes the filter again for the combined noise and shows the table with the old and the new tuning.
 
 Examples
     python noise_all_signals.py --quick
@@ -157,6 +159,121 @@ def theory_hint(cfg, dt=2e-4):
           " so r_w must be tuned (--tune)")
 
 
+# =============================================================================
+# Graphs
+# =============================================================================
+CASE_NAMES = {"s_i": "current", "s_th_deg": "Hall angle", "s_edge_us": "edge timing",
+              "s_pos_deg": "edge position", "s_v": "voltage"}
+CASE_UNITS = {"s_i": "A", "s_th_deg": "deg", "s_edge_us": "us", "s_pos_deg": "deg", "s_v": "V"}
+
+
+def estimate_torque(data, variant, params):
+    x = k.run_filter(data, variant, params, {})
+    return x[:, 3] / k.base.Gload
+
+
+def plot_results(variant, cfg, params, tag, rows, a):
+    """Graphs for one filter tuning: true torque, estimate without noise, estimate with noise (each noise source
+    alone and all together), the difference, and a bar chart of the errors."""
+    import matplotlib
+    if a.no_show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(a.out_dir, exist_ok=True)
+    print("simulating the movement (PWM %.2f, start %g deg) for the graphs (%s) ..." % (a.pwm, a.angle, tag))
+    data = k.generate_run(a.pwm, a.angle, +1)
+    if data is None:
+        raise SystemExit("the cam does not move 40 deg at this PWM")
+    sl = slice(None, None, k.KF_DECIMATION)
+    cam = data["Gdeg"][sl]
+    true = data["Tab"][sl]
+    keep = (data["t"][sl] - data["t"][0]) * 1000.0 >= a.skip_ms
+    clean = estimate_torque(data, variant, params)
+
+    def err(est):
+        m = k.metrics(true[keep], est[keep])
+        return m["RMSE"], m["RMSE_pct"]
+
+    active = {key: v for key, v in cfg.items() if v > 0}
+    cases = [("%s only" % CASE_NAMES[key], key, {key: v}) for key, v in active.items()]
+    if len(active) > 1:
+        cases.append(("all together", "all", active))
+    full0 = dict(s_i=0.0, s_th_deg=0.0, s_edge_us=0.0, s_pos_deg=0.0, s_v=0.0)
+    figs, diffs = [], {}
+    r0, p0 = err(clean)
+    for label, key, c in cases:
+        full = dict(full0)
+        full.update(c)
+        noisy = estimate_torque(add_noise(data, seed=1, **full), variant, params)
+        diffs[label] = noisy - clean
+        r1, p1 = err(noisy)
+        txt = ", ".join("%s %g %s" % (CASE_NAMES[q], v, CASE_UNITS[q]) for q, v in c.items())
+        fig, ax = plt.subplots(figsize=(10, 6.0))
+        ax.plot(cam, true, color="#555555", lw=4.0, label="true torque")
+        ax.plot(cam[1:], clean[1:], color="#2e7d32", lw=1.8, ls="--", label="estimate without noise")
+        ax.plot(cam[1:], noisy[1:], color="#c0392b", lw=1.0, label="estimate with noise")
+        ax.set_xlabel("cam angle [deg]", fontsize=11)
+        ax.set_ylabel("camshaft torque [N*m]", fontsize=11)
+        ax.set_title("%s, noise on %s (%s)\nerror without noise %.3f N*m (%.2f %%),  with noise %.3f N*m (%.2f %%)"
+                     "   (first %g ms left out)" % (tag, label, txt, r0, p0, r1, p1, a.skip_ms), fontsize=10)
+        ax.grid(True, alpha=0.4)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=10)
+        fig.tight_layout()
+        path = os.path.join(a.out_dir, "noise_all_%s_%s.png" % (tag.split()[0], key))
+        fig.savefig(path, dpi=150)
+        print("saved %s" % path)
+        figs.append(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    for (label, d), col in zip(diffs.items(), ("#1f77b4", "#e08a00", "#6a3d9a", "#2e7d32", "#555555", "#c0392b")):
+        ax.plot(cam[1:], d[1:], lw=1.0, color=col, label=label)
+    ax.axhline(0, color="gray", lw=0.8)
+    lim = 1.3 * max(np.abs(d[keep]).max() for d in diffs.values())
+    startup = max(np.abs(d[1:]).max() for d in diffs.values())
+    ax.set_ylim(-lim, lim)
+    ax.text(0.98, 0.04, "start-up (first %g ms) differences up to %.1f N*m are outside the range shown" % (a.skip_ms, startup),
+            transform=ax.transAxes, ha="right", fontsize=9, color="#555555")
+    ax.set_xlabel("cam angle [deg]", fontsize=11)
+    ax.set_ylabel("estimate with noise - estimate without noise [N*m]", fontsize=11)
+    ax.set_title("%s: change of the torque prediction caused by each noise source" % tag, fontsize=11)
+    ax.grid(True, alpha=0.4)
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    path = os.path.join(a.out_dir, "noise_all_%s_difference.png" % tag.split()[0])
+    fig.savefig(path, dpi=150)
+    print("saved %s" % path)
+    figs.append(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    names = [r[0] for r in rows]
+    vals = [r[1] for r in rows]
+    cols = ["#2e7d32" if n == "no noise" else "#c0392b" if n == "all together" else "#e08a00" for n in names]
+    ax.bar(np.arange(len(rows)), vals, color=cols)
+    for x, v in enumerate(vals):
+        ax.text(x, v, "%.2f %%" % v, ha="center", va="bottom", fontsize=10)
+    ax.set_xticks(np.arange(len(rows)))
+    ax.set_xticklabels([n.replace(" ", "\n", 1) for n in names], fontsize=9)
+    ax.set_ylabel("torque error (RMSE in % of the rms torque)", fontsize=11)
+    ax.set_title("%s: torque error on the test runs for each noise source" % tag, fontsize=11)
+    ax.grid(True, axis="y", alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(a.out_dir, "noise_all_%s_summary.png" % tag.split()[0])
+    fig.savefig(path, dpi=150)
+    print("saved %s" % path)
+    figs.append(fig)
+    return figs
+
+
+def finish(figs, a):
+    import matplotlib.pyplot as plt
+    if not a.no_show:
+        plt.show()
+    else:
+        for f in figs:
+            plt.close(f)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant", default="no_interp", choices=["interp", "no_interp"])
@@ -171,10 +288,24 @@ def main():
     ap.add_argument("--seeds", type=int, default=3, help="noise realisations averaged in the table (default 3)")
     ap.add_argument("--skip-ms", type=float, default=20.0, help="start-up time left out of the errors [ms] (default 20)")
     ap.add_argument("--quick", action="store_true", help="small data set and few evaluations")
+    ap.add_argument("--plot", action="store_true", help="make the graphs (torque with/without noise per source, difference, summary)")
+    ap.add_argument("--plot-only", action="store_true", help="no tuning/table: read <out>.json of an earlier run and make the graphs")
+    ap.add_argument("--pwm", type=float, default=0.12, help="PWM of the movement in the graphs (default 0.12)")
+    ap.add_argument("--angle", type=float, default=20.0, help="start angle of the movement in the graphs [deg] (default 20)")
+    ap.add_argument("--out-dir", default=".", help="folder for the png files (default: current folder)")
+    ap.add_argument("--no-show", action="store_true", help="save the png files but do not open the figures")
     ap.add_argument("--out", default="noise_all", help="prefix of the output files / data caches")
     a = ap.parse_args()
 
     k.SKIP_S = a.skip_ms * 1e-3
+    if a.plot_only:
+        with open(a.out + ".json") as f:
+            r = json.load(f)
+        figs = plot_results(r["variant"], r["noise"], r["params_given"], "given-tuning", r["table_given_tuning"], a)
+        if "params_new" in r:
+            figs += plot_results(r["variant"], r["noise"], r["params_new"], "new-tuning", r["table_new_tuning"], a)
+        finish(figs, a)
+        return
     cfg = dict(s_i=a.sigma_i, s_th_deg=a.sigma_th, s_edge_us=a.sigma_edge, s_pos_deg=a.sigma_pos, s_v=a.sigma_v)
     if a.variant == "interp":                        # edge noise does not exist in this variant
         cfg["s_edge_us"] = cfg["s_pos_deg"] = 0.0
@@ -206,7 +337,7 @@ def main():
             print("%-26s %11.2f%% %11.2f" % (label, m, s))
         return rows
 
-    result = {"variant": a.variant, "noise": cfg, "tuning_used": source}
+    result = {"variant": a.variant, "noise": cfg, "tuning_used": source, "params_given": params}
     result["table_given_tuning"] = show("Torque error on the test runs, given tuning (errors in %% of rms torque, "
                                         "first %g ms left out)" % a.skip_ms, params)
 
@@ -229,12 +360,17 @@ def main():
         print("\nnew tuning:")
         for n in k.PARAM_NAMES:
             print("  %-5s old %-12.5g new %-12.5g" % (n, params[n], new[n]))
-        result["tuned_for_this_noise"] = new
+        result["params_new"] = new
         result["table_new_tuning"] = show("Torque error on the test runs, NEW tuning", new)
 
     with open(a.out + ".json", "w") as f:
         json.dump(result, f, indent=2)
     print("\nsaved %s.json  (%.0f s)" % (a.out, time.time() - t0))
+    if a.plot:
+        figs = plot_results(a.variant, cfg, params, "given-tuning", result["table_given_tuning"], a)
+        if a.tune:
+            figs += plot_results(a.variant, cfg, new, "new-tuning", result["table_new_tuning"], a)
+        finish(figs, a)
 
 
 if __name__ == "__main__":
