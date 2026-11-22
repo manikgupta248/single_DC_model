@@ -163,8 +163,9 @@ def run_filter(data, variant, p, mm, dec=KF_DECIMATION, gains=None):
     sl = slice(None, None, dec)
     t = data["t"][sl]
     z_i = data["i_meas"][sl]
-    Q = data["Camshaft_quantanizer"][sl]
-    Hall = data["Hall_out"][sl]
+    Q = data.get("Q_meas", data["Camshaft_quantanizer"])[sl]     # noisy copies (noise_all_signals.py) if present
+    Hall = data.get("Hall_meas", data["Hall_out"])[sl]
+    V_k = data["V_meas"][sl] if "V_meas" in data else None       # measured voltage, optional
     dt = float(t[1] - t[0])
     F, Bd, Qd = build_model(dt, p["q_w"], p["q_i"], p["q_T"], mm)
     Bu = Bd * data["V"]
@@ -179,7 +180,7 @@ def run_filter(data, variant, p, mm, dec=KF_DECIMATION, gains=None):
     B_m, J_m = base.Bc, base.J
     t_edge_prev, s_prev = None, 0.0
     for k in range(1, n):
-        x = F @ x + Bu                                  # predict
+        x = F @ x + (Bu if V_k is None else Bd * V_k[k])    # predict
         P = F @ P @ F.T + Qd
         # --- current update (every step) ---
         S = P[2, 2] + r_i
