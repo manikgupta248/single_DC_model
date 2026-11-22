@@ -3,15 +3,18 @@ plot_kalman_results.py - plots the results of the Kalman filter (variant no_inte
 for a constant PWM (default 0.12, any value with --pwm) and four start angles of the cam.
 
 For every start angle the cam moves 40 deg forward (e.g. 20 -> 60 deg) and the script makes
-three SEPARATE figures (12 figures for the four start angles at one PWM):
+four SEPARATE figures (16 figures for the four start angles at one PWM):
     kalman_torque_pwm<PWM>_start<angle>.png       : true camshaft torque and Kalman filter estimate against the cam angle
-    kalman_gain_pwm<PWM>_start<angle>.png         : gain of the TORQUE state for the current update against time
-    kalman_gain_current_pwm<PWM>_start<angle>.png : gain of the CURRENT itself for the current update against time
+    kalman_gain_pwm<PWM>_start<angle>.png         : gain of the TORQUE for the current update against time
+    kalman_gain_current_pwm<PWM>_start<angle>.png : gain of the CURRENT for the current update against time
+    kalman_gain_angle_pwm<PWM>_start<angle>.png   : gain of the ANGLE for the Hall-angle update, at every Hall edge
 
-In the current update the current error (measured - predicted, in A) corrects every state with its own gain K:
-    state_new = state_pred + K * current_error
+Every measurement error (measured - predicted) corrects each state with its own gain K:
+    state_new = state_pred + K * error
     K of the torque : [N*m (motor side) per A], can be larger than 1 (unit conversion)
-    K of the current: a fraction between 0 and 1 (how much of the error the current estimate accepts)
+    K of the current: fraction between 0 and 1 (how much of the current error the current estimate accepts)
+    K of the angle  : fraction between 0 and 1 (how much of the angle error the angle estimate accepts);
+                      in the variant no_interp the angle is measured only when a Hall edge occurs
 
 Needs: numpy, matplotlib, and emotor_cam_move.py + torque_kf.py from the repository (it runs the
 simulation of the motor model itself).
@@ -62,6 +65,7 @@ def run_filter_with_gain(data, p):
     out[0] = x
     gains = []                                           # torque gain of the current update
     gains_i = []                                         # gain of the current itself in the current update
+    edge_t, gains_a, edge_r = [], [], []                 # Hall edges: time [ms], gain of the angle, noise R of the angle
     t_edge_prev, s_prev = None, 0.0
     for i in range(1, n):
         x = F @ x + Bu                                   # predict
@@ -80,6 +84,9 @@ def run_filter_with_gain(data, p):
         z = Q[i] - s * q / 2 + w_hat * dt / 2
         r = p["r_th"] + (w_hat * dt) ** 2 / 12
         K = P[:, 0] / (P[0, 0] + r)
+        edge_t.append(1000.0 * (t[i] - t[0]))
+        gains_a.append(float(K[0]))                      # gain of the angle state in the angle update
+        edge_r.append(float(r))
         x = x + K * (z - x[0])
         P = P - np.outer(K, P[0])
         t_edge = t[i] - dt / 2                           # speed from the time between two edges
@@ -94,7 +101,7 @@ def run_filter_with_gain(data, p):
         t_edge_prev, s_prev = t_edge, s
         P = 0.5 * (P + P.T)
         out[i] = x
-    return out, gains, gains_i
+    return out, dict(torque=gains, current=gains_i, edge_t=edge_t, angle=gains_a, edge_r=edge_r)
 
 
 def run_case(angle, pwm):
@@ -102,7 +109,7 @@ def run_case(angle, pwm):
     data = k.generate_run(pwm, angle, +1)
     if data is None:
         return None                                                  # the cam did not move 40 deg (PWM too low)
-    x, gains, gains_i = run_filter_with_gain(data, PARAMS)           # estimates (n x 4), gains (n-1)
+    x, glog = run_filter_with_gain(data, PARAMS)                     # estimates (n x 4) and the logged gains
     ref = k.run_filter(data, VARIANT, PARAMS, {})                    # check against the filter of torque_kf.py
     if np.abs(ref - x).max() > 1e-9:
         print("WARNING: the filter in this script differs from torque_kf.run_filter by %.2e" % np.abs(ref - x).max())
@@ -113,8 +120,11 @@ def run_case(angle, pwm):
                 cam=data["Gdeg"][sl],                                 # actual cam angle [deg]
                 true_cam=data["Tab"][sl],                             # true camshaft torque [N*m]
                 est_cam=x[:, 3] / k.base.Gload,                       # filter estimate at the camshaft [N*m]
-                gain=np.array(gains),                                 # torque gain, steps 1 ... n-1
-                gain_i=np.array(gains_i))                             # gain of the current, steps 1 ... n-1
+                gain=np.array(glog["torque"]),                        # torque gain of the current update, steps 1 ... n-1
+                gain_i=np.array(glog["current"]),                     # gain of the current in the current update
+                edge_t=np.array(glog["edge_t"]),                      # time of every Hall edge [ms]
+                gain_a=np.array(glog["angle"]),                       # gain of the angle in the angle update at the edges
+                edge_r=np.array(glog["edge_r"]))                      # noise R used for the angle at the edges
 
 
 def both_metrics(c, skip_ms):
@@ -207,6 +217,28 @@ def gain_current_figure(c, out_dir):
     return fig
 
 
+def gain_angle_figure(c, out_dir):
+    t, g = c["edge_t"], c["gain_a"]
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    ax.plot(t, g, "o-", color="#6a3d9a", ms=3.5, lw=1.0)
+    ax.set_xlabel("time since the start of the movement [ms]", fontsize=11)
+    ax.set_ylabel("gain of the angle for the angle error\n(fraction of the error that is accepted, 0 to 1)", fontsize=11)
+    ax.set_title("Start angle %g deg, PWM %.2f: how the gain of the angle varies\n(the angle is measured only at the %d Hall edges)"
+                 % (c["angle"], c["pwm"], len(g)), fontsize=12)
+    ax.grid(True, alpha=0.4)
+    ax.set_ylim(0, g.max() * 1.6)
+    ax.text(0.97, 0.93, "gain between %.3f and %.3f, i.e. %.1f to %.1f %% of the angle error is accepted:\n"
+            "the Hall angle is trusted only weakly, because its noise R (%.1e to %.1e rad^2)\n"
+            "is much larger than the filter's own angle uncertainty (about 1e-6 rad^2)"
+            % (g.min(), g.max(), 100 * g.min(), 100 * g.max(), c["edge_r"].min(), c["edge_r"].max()),
+            transform=ax.transAxes, ha="right", va="top", fontsize=9.5, color="#4a2a73")
+    fig.tight_layout()
+    path = os.path.join(out_dir, "kalman_gain_angle_pwm%.2f_start%d.png" % (c["pwm"], round(c["angle"])))
+    fig.savefig(path, dpi=150)
+    print("saved %s" % path)
+    return fig
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-show", action="store_true", help="save the png files but do not open the figures")
@@ -232,13 +264,13 @@ def main():
     print()
     print("Torque error (RMSE of the camshaft torque, in N*m and in % of the rms torque):")
     print("%-6s %-12s %-10s %-30s %-30s %-10s" % ("PWM", "start angle", "duration", "including the first %g ms" % a.skip_ms,
-                                              "without the first %g ms" % a.skip_ms, "torque gain / current gain (settled)"))
+                                              "without the first %g ms" % a.skip_ms, "gains: torque / current (settled) / angle (range)"))
     for c in cases:
         m_all, m_ex = both_metrics(c, a.skip_ms)
         print("%-6s %-12s %-10s %-30s %-30s %-10s" % (
             "%.2f" % c["pwm"], "%g deg" % c["angle"], "%.3f s" % (c["t_ms"][-1] / 1000),
             "%.3f N*m (%.2f %%)" % (m_all["RMSE"], m_all["RMSE_pct"]),
-            "%.3f N*m (%.2f %%)" % (m_ex["RMSE"], m_ex["RMSE_pct"]), "%.3f / %.5f" % (c["gain"][-1], c["gain_i"][-1])))
+            "%.3f N*m (%.2f %%)" % (m_ex["RMSE"], m_ex["RMSE_pct"]), "%.3f / %.5f / %.3f-%.3f" % (c["gain"][-1], c["gain_i"][-1], c["gain_a"].min(), c["gain_a"].max())))
     print()
     for pwm in a.pwm:
         cp = {c["angle"]: c for c in cases if c["pwm"] == pwm}
@@ -260,6 +292,10 @@ def main():
             plt.close(fig)
     for c in cases:
         fig = gain_current_figure(c, a.out_dir)
+        if a.no_show:
+            plt.close(fig)
+    for c in cases:
+        fig = gain_angle_figure(c, a.out_dir)
         if a.no_show:
             plt.close(fig)
     if not a.no_show:
