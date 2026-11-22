@@ -1,6 +1,6 @@
 """
 plot_kalman_results.py - plots the results of the Kalman filter (variant no_interp = Hall edges only)
-for a constant PWM of 0.12 and four start angles of the cam.
+for a constant PWM (default 0.12, any value with --pwm) and four start angles of the cam.
 
 For every start angle the cam moves 40 deg forward (e.g. 20 -> 60 deg) and the script makes
 two SEPARATE figures, so 8 figures in total:
@@ -32,7 +32,7 @@ if "--no-show" in sys.argv:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-PWM = 0.12
+PWM_DEFAULT = (0.12,)                           # constant PWM duty; change with --pwm, e.g. --pwm 0.12 0.18
 START_ANGLES = (20.0, 110.0, 200.0, 290.0)      # deg of cam angle, forward sweep of 40 deg each
 VARIANT = "no_interp"                           # Hall edges: exact edge angle + speed from the edge timing
 # tuned noise settings of the variant no_interp (from the tuning run of torque_kf.py)
@@ -92,18 +92,18 @@ def run_filter_with_gain(data, p):
     return out, gains
 
 
-def run_case(angle):
+def run_case(angle, pwm):
     """Simulate one sweep and run the Kalman filter on it. Returns a dict with everything to plot."""
-    data = k.generate_run(PWM, angle, +1)
+    data = k.generate_run(pwm, angle, +1)
     if data is None:
-        raise RuntimeError("the cam did not move 40 deg for start angle %g" % angle)
+        return None                                                  # the cam did not move 40 deg (PWM too low)
     x, gains = run_filter_with_gain(data, PARAMS)                    # estimates (n x 4), gains (n-1)
     ref = k.run_filter(data, VARIANT, PARAMS, {})                    # check against the filter of torque_kf.py
     if np.abs(ref - x).max() > 1e-9:
         print("WARNING: the filter in this script differs from torque_kf.run_filter by %.2e" % np.abs(ref - x).max())
     sl = slice(None, None, k.KF_DECIMATION)
     t_ms = (data["t"][sl] - data["t"][0]) * 1000.0
-    return dict(angle=angle,
+    return dict(angle=angle, pwm=pwm,
                 t_ms=t_ms,
                 cam=data["Gdeg"][sl],                                 # actual cam angle [deg]
                 true_cam=data["Tab"][sl],                             # true camshaft torque [N*m]
@@ -135,11 +135,11 @@ def torque_figure(c, skip_ms, out_dir, show):
     note = ("including the first %g ms:    RMSE %.3f N*m = %.2f %% of the rms torque,  R2 = %.4f\n"
             "without the first %g ms:   RMSE %.3f N*m = %.2f %% of the rms torque,  R2 = %.4f"
             % (skip_ms, m_all["RMSE"], m_all["RMSE_pct"], m_all["R2"], skip_ms, m_ex["RMSE"], m_ex["RMSE_pct"], m_ex["R2"]))
-    ax.set_title("Start angle %g deg, PWM %.2f: true and estimated camshaft torque\n%s" % (c["angle"], PWM, note), fontsize=11)
+    ax.set_title("Start angle %g deg, PWM %.2f: true and estimated camshaft torque\n%s" % (c["angle"], c["pwm"], note), fontsize=11)
     ax.grid(True, alpha=0.4)
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, fontsize=10)
     fig.tight_layout()
-    path = os.path.join(out_dir, "kalman_torque_start%d.png" % round(c["angle"]))
+    path = os.path.join(out_dir, "kalman_torque_pwm%.2f_start%d.png" % (c["pwm"], round(c["angle"])))
     fig.savefig(path, dpi=150)
     print("saved %s" % path)
     return (m_all, m_ex), fig
@@ -154,7 +154,7 @@ def gain_figure(c, out_dir):
     ax.semilogx(t[:15], g[:15], "o", color="#c0392b", ms=5)
     ax.set_xlabel("time since the start of the movement [ms], log scale (one filter step = 0.2 ms)", fontsize=11)
     ax.set_ylabel("gain of the torque for the current error\n[N*m (motor side) per A]", fontsize=11)
-    ax.set_title("Start angle %g deg, PWM %.2f: how the torque gain varies" % (c["angle"], PWM), fontsize=12.5)
+    ax.set_title("Start angle %g deg, PWM %.2f: how the torque gain varies" % (c["angle"], c["pwm"]), fontsize=12.5)
     ax.grid(True, alpha=0.4, which="both")
     ax.set_ylim(0, g.max() * 1.15)
     ax.annotate("step 1 (0.2 ms): %.2f" % g[0], xy=(t[0], g[0]), xytext=(t[0] * 1.6, g[0] * 0.97),
@@ -168,7 +168,7 @@ def gain_figure(c, out_dir):
     ax.text(t[-1], g[-1] + 0.05, "settled value %.3f (constant from about 2 ms on)" % g[-1], ha="right", fontsize=10,
             color="#555555")
     fig.tight_layout()
-    path = os.path.join(out_dir, "kalman_gain_start%d.png" % round(c["angle"]))
+    path = os.path.join(out_dir, "kalman_gain_pwm%.2f_start%d.png" % (c["pwm"], round(c["angle"])))
     fig.savefig(path, dpi=150)
     print("saved %s" % path)
     return fig
@@ -179,36 +179,52 @@ def main():
     ap.add_argument("--no-show", action="store_true", help="save the png files but do not open the figures")
     ap.add_argument("--out-dir", default=".", help="folder for the png files (default: current folder)")
     ap.add_argument("--skip-ms", type=float, default=20.0, help="start-up time [ms] that is left out in the second metric (default 20)")
+    ap.add_argument("--pwm", type=float, nargs="+", default=list(PWM_DEFAULT),
+                    help="constant PWM duty (one or more values, default 0.12). Below about 0.05 the cam cannot move 40 deg.")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
     cases = []
-    for angle in START_ANGLES:
-        print("start angle %g deg: simulating the movement and running the filter ..." % angle)
-        cases.append(run_case(angle))
+    for pwm in a.pwm:
+        for angle in START_ANGLES:
+            print("PWM %.2f, start angle %g deg: simulating the movement and running the filter ..." % (pwm, angle))
+            c = run_case(angle, pwm)
+            if c is None:
+                print("   the cam does not move 40 deg at PWM %.2f (too low) -> skipped" % pwm)
+            else:
+                cases.append(c)
+    if not cases:
+        raise SystemExit("no case could be run")
 
     print()
     print("Torque error (RMSE of the camshaft torque, in N*m and in % of the rms torque):")
-    print("%-12s %-10s %-30s %-30s %-10s" % ("start angle", "duration", "including the first %g ms" % a.skip_ms,
-                                          "without the first %g ms" % a.skip_ms, "gain"))
+    print("%-6s %-12s %-10s %-30s %-30s %-10s" % ("PWM", "start angle", "duration", "including the first %g ms" % a.skip_ms,
+                                              "without the first %g ms" % a.skip_ms, "gain"))
     for c in cases:
         m_all, m_ex = both_metrics(c, a.skip_ms)
-        print("%-12s %-10s %-30s %-30s %-10s" % (
-            "%g deg" % c["angle"], "%.3f s" % (c["t_ms"][-1] / 1000),
+        print("%-6s %-12s %-10s %-30s %-30s %-10s" % (
+            "%.2f" % c["pwm"], "%g deg" % c["angle"], "%.3f s" % (c["t_ms"][-1] / 1000),
             "%.3f N*m (%.2f %%)" % (m_all["RMSE"], m_all["RMSE_pct"]),
             "%.3f N*m (%.2f %%)" % (m_ex["RMSE"], m_ex["RMSE_pct"]), "%.3f" % c["gain"][-1]))
     print()
-    for i, j in ((0, 2), (1, 3)):
-        n = min(len(cases[i]["est_cam"]), len(cases[j]["est_cam"]))
-        d = np.abs(cases[i]["est_cam"][:n] - cases[j]["est_cam"][:n]).max()
-        print("estimates for %g deg and %g deg differ by at most %.2e N*m (the cam torque repeats every 60 deg)"
-              % (cases[i]["angle"], cases[j]["angle"], d))
+    for pwm in a.pwm:
+        cp = {c["angle"]: c for c in cases if c["pwm"] == pwm}
+        for u, v in ((20.0, 200.0), (110.0, 290.0)):
+            if u in cp and v in cp:
+                n = min(len(cp[u]["est_cam"]), len(cp[v]["est_cam"]))
+                d = np.abs(cp[u]["est_cam"][:n] - cp[v]["est_cam"][:n]).max()
+                print("PWM %.2f: estimates for %g deg and %g deg differ by at most %.2e N*m (the cam torque repeats every 60 deg)"
+                      % (pwm, u, v, d))
     print()
 
     for c in cases:
-        torque_figure(c, a.skip_ms, a.out_dir, not a.no_show)
+        _, fig = torque_figure(c, a.skip_ms, a.out_dir, not a.no_show)
+        if a.no_show:
+            plt.close(fig)                                  # do not keep the figure in memory
     for c in cases:
-        gain_figure(c, a.out_dir)
+        fig = gain_figure(c, a.out_dir)
+        if a.no_show:
+            plt.close(fig)
     if not a.no_show:
         plt.show()
 
