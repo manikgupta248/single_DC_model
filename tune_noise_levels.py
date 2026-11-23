@@ -22,6 +22,8 @@ Graphs of the ROBUST tuning (separate figures, saved as png):
     noise_torque_sigma<s>.png : true torque, estimate without noise and with noise (one figure per noise level)
     noise_difference.png      : estimate with noise minus estimate without noise, against the cam angle
     noise_summary.png         : torque error without and with noise (bars); the table of the differences is printed
+    RMSE [N*m, camshaft side], RMSE in % of the rms torque and R^2 are printed for every tuning/noise level and are
+    written in the titles of the graphs (R^2 = 1 - sum(error^2) / sum((true - mean(true))^2), 1 = perfect).
 
 Needs numpy, emotor_cam_move.py and torque_kf.py from the repository.
 """
@@ -60,6 +62,15 @@ def score(params, variant, runs):
     return float(np.mean(vals))
 
 
+def score_all(params, variant, runs):
+    """Mean over the runs of RMSE [N*m], RMSE in % of the rms torque and R^2 (camshaft torque, without the start-up)."""
+    ms = []
+    for d in runs:
+        e = k.estimates(d, variant, params, "nominal")
+        ms.append(k.metrics(e["true_cam"], e["est_cam"]))
+    return {key: float(np.mean([m[key] for m in ms])) for key in ("RMSE", "RMSE_pct", "R2")}
+
+
 def estimate_torque(data, variant, params, sigma, seed):
     """Camshaft torque estimate (decimated) with Gaussian noise (std sigma [A]) added to the measured current."""
     d = dict(data)
@@ -94,14 +105,14 @@ def plot_results(variant, params, levels, a):
 
     def err(est):
         m = k.metrics(true[keep], est[keep])
-        return m["RMSE"], m["RMSE_pct"]
+        return m["RMSE"], m["RMSE_pct"], m["R2"]
 
     figs, diffs = [], {}
     for sigma in sigmas:
         noisy = estimate_torque(data, variant, params, sigma, 1)
         diffs[sigma] = noisy - clean
-        r0, p0 = err(clean)
-        r1, p1 = err(noisy)
+        r0, p0, q0 = err(clean)
+        r1, p1, q1 = err(noisy)
         fig, ax = plt.subplots(figsize=(10, 6.0))
         ax.plot(cam, true, color="#555555", lw=4.0, label="true torque")
         ax.plot(cam[1:], clean[1:], color="#2e7d32", lw=1.8, ls="--", label="estimate without noise")
@@ -109,8 +120,9 @@ def plot_results(variant, params, levels, a):
         ax.set_xlabel("cam angle [deg]", fontsize=11)
         ax.set_ylabel("camshaft torque [N*m]", fontsize=11)
         ax.set_title("Robust tuning, noise on the current sigma = %g A: true and estimated torque\n"
-                     "error without noise %.3f N*m (%.2f %%),  with noise %.3f N*m (%.2f %%)   (first %g ms left out)"
-                     % (sigma, r0, p0, r1, p1, a.skip_ms), fontsize=11)
+                     "without noise: RMSE %.3f N*m (%.2f %%), R$^2$ = %.4f      with noise: RMSE %.3f N*m (%.2f %%), "
+                     "R$^2$ = %.4f\n(first %g ms left out)"
+                     % (sigma, r0, p0, q0, r1, p1, q1, a.skip_ms), fontsize=10)
         ax.grid(True, alpha=0.4)
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=10)
         fig.tight_layout()
@@ -139,33 +151,38 @@ def plot_results(variant, params, levels, a):
     print("saved %s" % path)
     figs.append(fig)
 
-    r0, p0 = err(clean)
+    r0, p0, q0 = err(clean)
     rms_true = float(np.sqrt(np.mean(true[keep] ** 2)))
     rows = []
     for sigma in sigmas:
-        dif, mx, e1 = [], [], []
+        dif, mx, e1, e2, e3 = [], [], [], [], []
         for seed in range(1, a.seeds + 1):
             noisy = estimate_torque(data, variant, params, sigma, seed)
             dd = (noisy - clean)[keep]
             dif.append(np.sqrt(np.mean(dd ** 2)))
             mx.append(np.abs(dd).max())
-            e1.append(err(noisy)[1])
-        rows.append((sigma, float(np.mean(dif)), float(np.mean(mx)), float(np.mean(e1))))
+            m1 = err(noisy)
+            e1.append(m1[1])
+            e2.append(m1[0])
+            e3.append(m1[2])
+        rows.append((sigma, float(np.mean(dif)), float(np.mean(mx)), float(np.mean(e1)),
+                     float(np.mean(e2)), float(np.mean(e3))))
 
     fig, ax = plt.subplots(figsize=(9, 5.4))
     xs = np.arange(len(sigmas))
     ax.bar(xs - 0.2, [p0] * len(xs), width=0.38, color="#2e7d32", label="without noise")
     ax.bar(xs + 0.2, [r[3] for r in rows], width=0.38, color="#c0392b", label="with noise")
     for x, r in zip(xs, rows):
-        ax.text(x + 0.2, r[3] + 0.05, "%.2f %%" % r[3], ha="center", fontsize=10)
-        ax.text(x - 0.2, p0 + 0.05, "%.2f %%" % p0, ha="center", fontsize=10)
+        ax.text(x + 0.2, r[3] + 0.05, "%.2f %%\nR$^2$ = %.4f" % (r[3], r[5]), ha="center", fontsize=9)
+        ax.text(x - 0.2, p0 + 0.05, "%.2f %%\nR$^2$ = %.4f" % (p0, q0), ha="center", fontsize=9)
     ax.set_xticks(xs)
     ax.set_xticklabels(["sigma = %g A" % s for s in sigmas])
     ax.set_ylabel("torque error (RMSE in % of the rms torque)", fontsize=11)
     ax.set_title("Robust tuning: torque error without and with noise on the current\n(mean of %d noise realisations)" % a.seeds,
                  fontsize=12)
     ax.grid(True, axis="y", alpha=0.4)
-    ax.legend(fontsize=10)
+    ax.set_ylim(0, 1.15 * max([p0] + [r[3] for r in rows]))
+    ax.legend(fontsize=10, loc="upper left")
     fig.tight_layout()
     path = os.path.join(a.out_dir, "noise_summary.png")
     fig.savefig(path, dpi=150)
@@ -175,11 +192,13 @@ def plot_results(variant, params, levels, a):
     print()
     print("Difference between the torque prediction with noise and without noise (PWM %.2f, start %g deg, first %g ms left out)"
           % (a.pwm, a.angle, a.skip_ms))
-    print("rms torque of the movement: %.3f N*m;  error without noise: %.3f N*m (%.2f %%)" % (rms_true, r0, p0))
-    print("%-12s %-34s %-22s %-18s" % ("noise sigma", "rms difference of the prediction", "largest difference", "error with noise"))
-    for sigma, dif, mx, e1 in rows:
-        print("%-12s %-34s %-22s %-18s" % ("%g A" % sigma, "%.3f N*m (%.2f %% of rms)" % (dif, 100 * dif / rms_true),
-                                           "%.3f N*m" % mx, "%.2f %%" % e1))
+    print("rms torque of the movement: %.3f N*m" % rms_true)
+    print("without noise: RMSE %.3f N*m = %.2f %% of the rms torque, R2 = %.5f" % (r0, p0, q0))
+    print("%-10s %-32s %-18s %-14s %-12s %-10s %-10s" % ("noise", "rms difference of prediction", "largest diff.",
+                                                         "RMSE [N*m]", "RMSE [%]", "R2", "(with noise)"))
+    for sigma, dif, mx, e1, e2, e3 in rows:
+        print("%-10s %-32s %-18s %-14s %-12s %-10s" % ("%g A" % sigma, "%.3f N*m (%.2f %% of rms)" % (dif, 100 * dif / rms_true),
+                                                       "%.3f N*m" % mx, "%.3f" % e2, "%.2f %%" % e1, "%.5f" % e3))
     if not a.no_show:
         plt.show()
     else:
@@ -272,11 +291,22 @@ def main():
     print(" rows: how the filter was tuned     columns: noise level of the current in the test")
     print("=" * 100)
     print("%-34s" % "tuned for" + "".join("%14s" % ("test %g A" % s) for s in levels))
-    table = {}
+    table, full = {}, {}
     for name, params in tuned.items():
-        row = [score(params, a.variant, test_sets[s]) for s in levels]
-        table[name] = row
-        print("%-34s" % name + "".join("%13.2f%%" % r for r in row))
+        res = [score_all(params, a.variant, test_sets[s]) for s in levels]
+        full[name] = res
+        table[name] = [r["RMSE_pct"] for r in res]
+        print("%-34s" % name + "".join("%13.2f%%" % r["RMSE_pct"] for r in res))
+    print()
+    print(" RMSE of the camshaft torque in N*m (same rows and columns):")
+    print("%-34s" % "tuned for" + "".join("%14s" % ("test %g A" % s) for s in levels))
+    for name, res in full.items():
+        print("%-34s" % name + "".join("%14.4f" % r["RMSE"] for r in res))
+    print()
+    print(" R^2 of the camshaft torque (1 = perfect; same rows and columns):")
+    print("%-34s" % "tuned for" + "".join("%14s" % ("test %g A" % s) for s in levels))
+    for name, res in full.items():
+        print("%-34s" % name + "".join("%14.5f" % r["R2"] for r in res))
 
     print()
     print(" The tuned noise setting r_i of the current (it should be close to sigma^2 of the tuning noise):")
@@ -288,7 +318,9 @@ def main():
     print("%-34s %12.3g" % ("robust", p["r_i"]))
 
     with open(a.out + ".json", "w") as f:
-        json.dump({"variant": a.variant, "levels": levels, "tuned": tuned, "test_error_pct": table}, f, indent=2)
+        json.dump({"variant": a.variant, "levels": levels, "tuned": tuned, "test_error_pct": table,
+                   "test_rmse_Nm": {n: [r["RMSE"] for r in v] for n, v in full.items()},
+                   "test_r2": {n: [r["R2"] for r in v] for n, v in full.items()}}, f, indent=2)
     print("\nsaved %s.json" % a.out)
     if a.plot:
         plot_results(a.variant, tuned["robust (all levels together)"], levels, a)
